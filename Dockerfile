@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     gnupg \
     libssl-dev \
+    libcairo2-dev \
+    libglib2.0-dev \
     pkg-config \
     procps \
     python3 \
@@ -62,13 +64,21 @@ RUN python3 -m venv $VIRTUAL_ENV \
 
 RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 
-# 6. Install Claude Code
-RUN mkdir -p $NPM_CONFIG_PREFIX \
-    && npm install -g @anthropic-ai/claude-code
-
 # 7. Install Rust Stable
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 
+# 8. Install Claude Code (kept last so re-pulling the latest version
+#    only invalidates this cheap layer, not the toolchain above).
+#    Pass --build-arg CLAUDE_CODE_VERSION=latest (or a specific version) and
+#    rebuild to pick up a new release; bumping the value busts just this layer.
+ARG CLAUDE_CODE_VERSION=^2.1.280
+RUN mkdir -p $NPM_CONFIG_PREFIX \
+    && npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
+    && claude --version
+
+# Pre-create /workspace owned by the developer user, so it stays writable when
+# only individual paths are mounted inside it.
+RUN sudo install -d -o $USERNAME -g $USERNAME /workspace
 WORKDIR /workspace
 
 CMD ["/bin/bash"]
