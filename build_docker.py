@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 IMAGE_NAME = "ai-harness-sandbox"
 # Rebuild automatically when the last successful build is older than this.
@@ -23,38 +24,79 @@ HOME = Path.home()
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state")
 BUILD_STAMP = STATE_HOME / IMAGE_NAME / "last_build"
 
+CONTAINER_HOME = Path("/home/developer")
+WORKSPACE = Path("/workspace")
+
+
+class HomeMount(NamedTuple):
+    """A path under $HOME, mounted at the same place in the container's home."""
+
+    path: str
+    is_dir: bool = False
+    read_only: bool = False
+
+
+# Host config mounted into the container, per --config-* flag, along with the
+# environment variables passed through with it.
+CONFIGS = {
+    "git": {
+        "mounts": [
+            HomeMount(".gitconfig", read_only=True),
+            HomeMount(".gitconfig_local", read_only=True),
+        ],
+        "env": [],
+    },
+    "claude": {
+        "mounts": [HomeMount(".claude", is_dir=True), HomeMount(".claude.json")],
+        "env": ["ANTHROPIC_API_KEY"],
+    },
+    "gemini": {
+        "mounts": [HomeMount(".config/antigravity", is_dir=True), HomeMount(".gemini", is_dir=True)],
+        "env": ["GEMINI_API_KEY"],
+    },
+}
+
+# Caches shared with the host regardless of flags.
+CACHE_MOUNTS = [HomeMount(".cargo/registry", is_dir=True)]
+
 
 def fail(message):
     print(f"error: {message}", file=sys.stderr)
     sys.exit(1)
 
 
-# Host config mounted into the container, per --config-* flag. Directories end
-# in "/"; host paths are created if missing so docker doesn't create
-# root-owned ones in their place.
-CONFIGS = {
-    "git": {
-        "mounts": [".gitconfig:ro", ".gitconfig_local:ro"],
-        "env": [],
-    },
-    "claude": {
-        "mounts": [".claude/", ".claude.json"],
-        "env": ["ANTHROPIC_API_KEY"],
-    },
-    "gemini": {
-        "mounts": [".config/antigravity/", ".gemini/"],
-        "env": ["GEMINI_API_KEY"],
-    },
-}
+def volume(host_path, container_path, read_only=False):
+    mode = "ro,z" if read_only else "z"
+    return ["-v", f"{host_path}:{container_path}:{mode}"]
+
+
+def home_mount_args(mount):
+    host_path = HOME / mount.path
+    # Create it if missing, so docker doesn't create a root-owned one in its place.
+    if mount.is_dir:
+        host_path.mkdir(parents=True, exist_ok=True)
+    else:
+        host_path.parent.mkdir(parents=True, exist_ok=True)
+        host_path.touch()
+    return volume(host_path, CONTAINER_HOME / mount.path, mount.read_only)
+
+
+def config_args(name):
+    args = []
+    for mount in CONFIGS[name]["mounts"]:
+        args += home_mount_args(mount)
+    for var in CONFIGS[name]["env"]:
+        args += ["-e", f"{var}={os.environ.get(var, '')}"]
+    return args
 
 
 def workspace_mounts(paths, ro_paths):
     if not paths and not ro_paths:
-        return ["-v", f"{Path.cwd()}:/workspace:z"]
+        return volume(Path.cwd(), WORKSPACE)
 
     mounts = []
     seen_names = {}
-    for arg, mode in [(p, "z") for p in paths] + [(p, "ro,z") for p in ro_paths]:
+    for arg, read_only in [(p, False) for p in paths] + [(p, True) for p in ro_paths]:
         if not os.path.exists(arg):
             fail(f"no such file or directory: {arg}")
         host_path = Path(arg).resolve()
@@ -62,9 +104,9 @@ def workspace_mounts(paths, ro_paths):
             fail("refusing to mount /")
         name = host_path.name
         if name in seen_names:
-            fail(f"'{arg}' and '{seen_names[name]}' would both mount at /workspace/{name}")
+            fail(f"'{arg}' and '{seen_names[name]}' would both mount at {WORKSPACE / name}")
         seen_names[name] = arg
-        mounts += ["-v", f"{host_path}:/workspace/{name}:{mode}"]
+        mounts += volume(host_path, WORKSPACE / name, read_only)
     return mounts
 
 
@@ -76,21 +118,11 @@ def resource_limits():
     return ["--cpus", f"{cpus:g}", "--memory", f"{mem_mb}m", "--memory-swap", f"{mem_mb}m"]
 
 
-def config_args(name):
-    args = []
-    for mount in CONFIGS[name]["mounts"]:
-        rel, _, mode = mount.partition(":")
-        host_path = HOME / rel.rstrip("/")
-        if rel.endswith("/"):
-            host_path.mkdir(parents=True, exist_ok=True)
-        else:
-            host_path.parent.mkdir(parents=True, exist_ok=True)
-            host_path.touch()
-        opts = f"{mode},z" if mode else "z"
-        args += ["-v", f"{host_path}:/home/developer/{rel.rstrip('/')}:{opts}"]
-    for var in CONFIGS[name]["env"]:
-        args += ["-e", f"{var}={os.environ.get(var, '')}"]
-    return args
+def shell_command(exec_cmd):
+    if not exec_cmd:
+        return ["/bin/bash"]
+    # Run the command, then hand over to an interactive shell.
+    return ["/bin/bash", "-c", f"{exec_cmd}\nexec /bin/bash"]
 
 
 def image_exists():
@@ -118,7 +150,12 @@ def build(context_dir):
     BUILD_STAMP.touch()
 
 
-def main():
+def ensure_image(force):
+    if force or not image_exists() or build_is_stale():
+        build(Path(__file__).resolve().parent)  # past symlink
+
+
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-b", "--build", action="store_true", help="force a rebuild of the image before running"
@@ -143,38 +180,40 @@ def main():
             default=True,
             help=f"mount host {name} config into the container (default: on)",
         )
-    parser.add_argument("paths", nargs="*", metavar="PATH", help="files or directories to mount read-write (repeatable)")
-    args = parser.parse_args()
+    parser.add_argument(
+        "paths",
+        nargs="*",
+        metavar="PATH",
+        help="files or directories to mount read-write (repeatable)",
+    )
+    return parser.parse_args()
 
-    script_dir = Path(__file__).resolve().parent  # past symlink
+
+def docker_run_command(args):
     mounts = workspace_mounts(args.paths, args.ro)
-
-    if args.build or not image_exists() or build_is_stale():
-        build(script_dir)
-
-    (HOME / ".cargo/registry").mkdir(parents=True, exist_ok=True)
-    configs = []
+    for mount in CACHE_MOUNTS:
+        mounts += home_mount_args(mount)
     for name in CONFIGS:
         if getattr(args, f"config_{name}"):
-            configs += config_args(name)
+            mounts += config_args(name)
 
-    shell = ["/bin/bash"]
-    if args.exec:
-        # Run the command, then hand over to an interactive shell.
-        shell += ["-c", f'{args.exec}\nexec /bin/bash']
-
-    cmd = [
+    return [
         "docker", "run", "--rm", "-it",
         "--user", "1000:1000",
         "--network=bridge",
         *resource_limits(),
         *mounts,
-        *configs,
-        "-v", f"{HOME}/.cargo/registry:/home/developer/.cargo/registry:z",
-        "-w", "/workspace",
+        "-w", str(WORKSPACE),
         IMAGE_NAME,
-        *shell,
+        *shell_command(args.exec),
     ]  # fmt: skip
+
+
+def main():
+    args = parse_args()
+    # Build the command first, so bad paths fail before a slow image build.
+    cmd = docker_run_command(args)
+    ensure_image(args.build)
     # Replace this process so docker owns the terminal and signals directly.
     os.execvp(cmd[0], cmd)
 
