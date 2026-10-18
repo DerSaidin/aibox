@@ -2,7 +2,8 @@
 """Build (when stale) and run the AI harness sandbox container.
 
 With no paths, $PWD is mounted as /workspace. Otherwise each path (file or
-directory) is mounted as /workspace/<basename>.
+directory) is mounted as /workspace/<basename>; paths given with --ro are
+mounted read-only.
 """
 
 import argparse
@@ -26,13 +27,32 @@ def fail(message):
     sys.exit(1)
 
 
-def workspace_mounts(paths):
-    if not paths:
+# Host config mounted into the container, per --config-* flag. Directories end
+# in "/"; host paths are created if missing so docker doesn't create
+# root-owned ones in their place.
+CONFIGS = {
+    "git": {
+        "mounts": [".gitconfig:ro", ".gitconfig_local:ro"],
+        "env": [],
+    },
+    "claude": {
+        "mounts": [".claude/", ".claude.json"],
+        "env": ["ANTHROPIC_API_KEY"],
+    },
+    "gemini": {
+        "mounts": [".config/antigravity/", ".gemini/"],
+        "env": ["GEMINI_API_KEY"],
+    },
+}
+
+
+def workspace_mounts(paths, ro_paths):
+    if not paths and not ro_paths:
         return ["-v", f"{Path.cwd()}:/workspace:z"]
 
     mounts = []
     seen_names = {}
-    for arg in paths:
+    for arg, mode in [(p, "z") for p in paths] + [(p, "ro,z") for p in ro_paths]:
         if not os.path.exists(arg):
             fail(f"no such file or directory: {arg}")
         host_path = Path(arg).resolve()
@@ -42,8 +62,25 @@ def workspace_mounts(paths):
         if name in seen_names:
             fail(f"'{arg}' and '{seen_names[name]}' would both mount at /workspace/{name}")
         seen_names[name] = arg
-        mounts += ["-v", f"{host_path}:/workspace/{name}:z"]
+        mounts += ["-v", f"{host_path}:/workspace/{name}:{mode}"]
     return mounts
+
+
+def config_args(name):
+    args = []
+    for mount in CONFIGS[name]["mounts"]:
+        rel, _, mode = mount.partition(":")
+        host_path = HOME / rel.rstrip("/")
+        if rel.endswith("/"):
+            host_path.mkdir(parents=True, exist_ok=True)
+        else:
+            host_path.parent.mkdir(parents=True, exist_ok=True)
+            host_path.touch()
+        opts = f"{mode},z" if mode else "z"
+        args += ["-v", f"{host_path}:/home/developer/{rel.rstrip('/')}:{opts}"]
+    for var in CONFIGS[name]["env"]:
+        args += ["-e", f"{var}={os.environ.get(var, '')}"]
+    return args
 
 
 def image_exists():
@@ -76,39 +113,56 @@ def main():
     parser.add_argument(
         "-b", "--build", action="store_true", help="force a rebuild of the image before running"
     )
-    parser.add_argument("paths", nargs="*", metavar="PATH", help="files or directories to mount")
+    parser.add_argument(
+        "--ro",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="file or directory to mount read-only (repeatable)",
+    )
+    parser.add_argument(
+        "-e",
+        "--exec",
+        metavar="CMD",
+        help="command to run in the shell before it becomes interactive",
+    )
+    for name in CONFIGS:
+        parser.add_argument(
+            f"--config-{name}",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=f"mount host {name} config into the container (default: on)",
+        )
+    parser.add_argument("paths", nargs="*", metavar="PATH", help="files or directories to mount read-write (repeatable)")
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent  # past symlink
-    mounts = workspace_mounts(args.paths)
+    mounts = workspace_mounts(args.paths, args.ro)
 
     if args.build or not image_exists() or build_is_stale():
         build(script_dir)
 
-    # Make sure mounted config exists on the host, so docker doesn't create
-    # root-owned directories in its place.
-    for d in [".cargo/registry", ".claude", ".config/antigravity", ".gemini"]:
-        (HOME / d).mkdir(parents=True, exist_ok=True)
-    for f in [".claude.json", ".gitconfig", ".gitconfig_local"]:
-        (HOME / f).touch()
+    (HOME / ".cargo/registry").mkdir(parents=True, exist_ok=True)
+    configs = []
+    for name in CONFIGS:
+        if getattr(args, f"config_{name}"):
+            configs += config_args(name)
+
+    shell = ["/bin/bash"]
+    if args.exec:
+        # Run the command, then hand over to an interactive shell.
+        shell += ["-c", f'{args.exec}\nexec /bin/bash']
 
     cmd = [
         "docker", "run", "--rm", "-it",
         "--user", "1000:1000",
         "--network=bridge",
-        "-e", f"ANTHROPIC_API_KEY={os.environ.get('ANTHROPIC_API_KEY', '')}",
-        "-e", f"GEMINI_API_KEY={os.environ.get('GEMINI_API_KEY', '')}",
         *mounts,
+        *configs,
         "-v", f"{HOME}/.cargo/registry:/home/developer/.cargo/registry:z",
-        "-v", f"{HOME}/.claude:/home/developer/.claude:z",
-        "-v", f"{HOME}/.claude.json:/home/developer/.claude.json:z",
-        "-v", f"{HOME}/.config/antigravity:/home/developer/.config/antigravity:z",
-        "-v", f"{HOME}/.gemini:/home/developer/.gemini:z",
-        "-v", f"{HOME}/.gitconfig:/home/developer/.gitconfig:ro,z",
-        "-v", f"{HOME}/.gitconfig_local:/home/developer/.gitconfig_local:ro,z",
         "-w", "/workspace",
         IMAGE_NAME,
-        "/bin/bash",
+        *shell,
     ]  # fmt: skip
     # Replace this process so docker owns the terminal and signals directly.
     os.execvp(cmd[0], cmd)
