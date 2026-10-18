@@ -1,4 +1,4 @@
-FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     bat \
     direnv \
-    exa \
+    eza \
     fzf \
     jq \
     kakoune \
@@ -65,7 +65,14 @@ RUN python3 -m venv $VIRTUAL_ENV \
 RUN curl -fsSL https://antigravity.google/cli/install.sh | bash
 
 # 7. Install Rust Stable
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable \
+    --component llvm-tools-preview
+
+# Install cargo-llvm-cov from its prebuilt release (avoids a slow cargo install).
+RUN curl --proto '=https' --tlsv1.2 -fsSL \
+    "https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-$(uname -m)-unknown-linux-gnu.tar.gz" \
+    | tar xzf - -C $CARGO_HOME/bin \
+    && cargo llvm-cov --version
 
 # 8. Install Claude Code (kept last so re-pulling the latest version
 #    only invalidates this cheap layer, not the toolchain above).
