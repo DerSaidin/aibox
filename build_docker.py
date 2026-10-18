@@ -16,6 +16,8 @@ from pathlib import Path
 IMAGE_NAME = "ai-harness-sandbox"
 # Rebuild automatically when the last successful build is older than this.
 BUILD_MAX_AGE_SECONDS = 2 * 24 * 60 * 60
+# Share of host CPU and memory any one container may use.
+RESOURCE_FRACTION = 0.75
 
 HOME = Path.home()
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state")
@@ -64,6 +66,14 @@ def workspace_mounts(paths, ro_paths):
         seen_names[name] = arg
         mounts += ["-v", f"{host_path}:/workspace/{name}:{mode}"]
     return mounts
+
+
+def resource_limits():
+    cpus = (os.cpu_count() or 1) * RESOURCE_FRACTION
+    mem_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    mem_mb = int(mem_bytes * RESOURCE_FRACTION) // (1024 * 1024)
+    # Match --memory-swap to --memory so swap can't be used to exceed the cap.
+    return ["--cpus", f"{cpus:g}", "--memory", f"{mem_mb}m", "--memory-swap", f"{mem_mb}m"]
 
 
 def config_args(name):
@@ -157,6 +167,7 @@ def main():
         "docker", "run", "--rm", "-it",
         "--user", "1000:1000",
         "--network=bridge",
+        *resource_limits(),
         *mounts,
         *configs,
         "-v", f"{HOME}/.cargo/registry:/home/developer/.cargo/registry:z",
