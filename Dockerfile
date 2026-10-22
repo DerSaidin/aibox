@@ -18,15 +18,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
+    tmux \
+    tokei \
     bat \
     direnv \
     eza \
+    file \
     fzf \
+    htop \
     jq \
     kakoune \
+    less \
     p7zip-full \
     ripgrep \
     sudo \
+    unar \
+    unzip \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Node.js LTS (v20) for Claude Code
@@ -57,6 +65,11 @@ ENV CARGO_HOME=/home/$USERNAME/.cargo
 
 # Combine all binary locations into PATH
 ENV PATH="/home/$USERNAME/.local/bin:$VIRTUAL_ENV/bin:$NPM_CONFIG_PREFIX/bin:$CARGO_HOME/bin:$PATH"
+
+# Login shells (bash -l, su -, tmux panes) source /etc/profile, which resets
+# PATH and drops the entries above. Restore them from /etc/profile.d.
+RUN echo "export PATH=\"/home/$USERNAME/.local/bin:$VIRTUAL_ENV/bin:$NPM_CONFIG_PREFIX/bin:$CARGO_HOME/bin:\$PATH\"" \
+    | sudo tee /etc/profile.d/aibox-path.sh > /dev/null
 
 # 5. Install Python virtual environment & Google Antigravity SDK / CLI
 RUN python3 -m venv $VIRTUAL_ENV \
